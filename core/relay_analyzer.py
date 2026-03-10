@@ -51,6 +51,25 @@ class RelayAnalyzer:
         # LDAP-detected tier-0 assets (more accurate than hostname heuristics)
         self.tier0_assets = tier0_assets or set()
 
+    def skeleton(self, all_results: Dict[str, Dict] = {}, ntlmv1_analysis: Dict = None) -> Dict:
+        analysis = {
+            'relay_paths': [],
+            'high_value_targets': {
+                'sccm': [],
+                'adcs': [],
+            },
+            'statistics': {
+                'total_hosts': len(all_results),
+                'relayable_hosts': 0,
+                'critical_paths': 0,
+                'high_paths': 0,
+                'medium_paths': 0,
+                'low_paths': 0,
+            },
+            'ntlmv1_analysis': ntlmv1_analysis
+        }
+        return analysis
+
     def analyze(self, all_results: Dict[str, Dict], ntlmv1_analysis: Dict = None) -> Dict:
         """
         Analyze all scan results and identify relay paths
@@ -61,6 +80,8 @@ class RelayAnalyzer:
 
         Returns:
             dict with relay paths, high-value targets, statistics
+        """
+        analysis = self.skeleton(all_results, ntlmv1_analysis)
         """
         analysis = {
             'relay_paths': [],
@@ -78,6 +99,7 @@ class RelayAnalyzer:
             },
             'ntlmv1_analysis': ntlmv1_analysis
         }
+        """
 
         # Identify relay paths for each host
         for host, protocol_results in all_results.items():

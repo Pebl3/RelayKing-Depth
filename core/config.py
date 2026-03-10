@@ -53,6 +53,9 @@ class RelayKingConfig:
     # Performance
     threads: int = 10
     timeout: int = 5
+    max_scangroup: int = 0
+    split_into: int = 1
+    skip: int = 0
 
     # Set of DC hostnames (populated by target_parser when --krb-dc-only is used)
     _dc_hostnames: Set[str] = None
@@ -231,6 +234,12 @@ Examples:
                            help='Number of threads (default: 10)')
     perf_group.add_argument('--timeout', type=int, default=5,
                            help='Connection timeout in seconds (default: 5)')
+    perf_group.add_argument('--max-scangroup', type=int, default=0,
+                           help='Scan group control, scan by group which contains N hosts (default: 0 [all])')
+    perf_group.add_argument('--split-into', type=int, default=1,
+                           help='Scan group control, split hosts into N groups (default: 1 [all])')
+    perf_group.add_argument('--skip', type=int, default=0,
+                           help='Scan group control, skip first N group (default: 0)')
 
     args = parser.parse_args()
 
@@ -261,6 +270,18 @@ Examples:
             parser.error('--coerce-all requires credentials (cannot use --null-auth)')
         if args.audit:
             parser.error('--coerce-all cannot be used with --audit (use --audit --coerce instead)')
+
+    if not (int(args.max_scangroup) >= 0):
+            parser.error('--max-scangroup requires to be int, >= 0')
+
+    if not (int(args.split_into) >= 1):
+            parser.error('--split_into requires to be int, >= 1')
+
+    if not (int(args.skip) >= 0):
+            parser.error('--skip requires to be int, >= 0')
+
+    if (args.max_scangroup != 0) and (args.split_into != 1):
+            parser.error('Specify only --max_scangroup or --split_into')
 
     # Parse hashes if provided
     lmhash = ''
@@ -322,7 +343,11 @@ Examples:
         gen_relay_list=args.gen_relay_list,
         verbose=args.verbose,
         threads=args.threads,
-        timeout=args.timeout
+        timeout=args.timeout,
+        max_scangroup=args.max_scangroup,
+        split_into=args.split_into,
+        skip=args.skip
+
     )
 
     return config

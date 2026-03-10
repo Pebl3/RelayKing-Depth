@@ -25,6 +25,7 @@ See the associated blog released on the Depth Security website for more details:
   - [Examples](#examples)
 - [Functionality Notes](#functionality-notes)
   - [Performance](#performance)
+  - [Grouping](#grouping)
   - [Feature Behavior Notes](#feature-behavior-notes)
 - [To-Do](#to-do)
 - [Current Known Bugs/Limitations](#current-known-bugslimitations)
@@ -147,6 +148,11 @@ python3 relayking.py -u ‘lowpriv’ -p ‘lowpriv-password’ -d client.domain
 ### Performance
 * There’s 10 main scanner threads/jobs by default, specified with `--threads`. Each main thread gets worker threads for certain tasks under it. HTTP, for example, uses 20 threads per main thread. This results in ~200 HTTP threads open to scan for HTTP NTLM auth. Most of the time, this is tolerated substantially well but if it causes lag/network issues, reduce the threads. The default of 10 threads is exceptionally quick anyways.
 * You probably pretty much always want to use `--proto-portscan` with all your scans. It significantly improves performance and prevents the scanner from waiting for timeouts on ports that aren't actually there. If it causes issues, you can remove at the expensive of scan performance (but it shouldn't!)
+### Grouping
+* Scan can be conducted with grouping by dividing hosts into groups. Options `--max-scangroup`, `--split-into` and `--skip` can be used to control grouping.
+- You can specify `--max-scangroup` to specify the number of targets for each group. For example, `--max-scangroup 100` will split 299 targets into 3 groups. Groups will have targets as 100, 100 and 99.
+- You can specify `--split-into` to specify the number of groups. For example, `--split-into 3` will split 299 targets into 3 groups. Groups will have targets as 100, 100 and 99. You cannot specify both `--max-scangroup` and `--split-into` in same time.
+- You can specify `--skip` to skip groups. For example, `--max-scangroup 3 --skip 1` will split 299 targets into 3 groups as 100, 100 and 99 targets, and skip the first group then starts scanning from second group. It helps when you would like to restart this tool.
 ### Feature Behavior Notes:
 * `--ntlmv1` or -`-ntlmv1-all`: Adding `--ntlmv1` will pull every LanMan GPO for the domain and nothing else. Requires low-priv AD creds. `--ntlmv1-all` requires admin credentials and will check **every individual host in the domain** with SMB open for the LMCompatibilityLevel registry key. Running at least `--ntlmv1` **is required to show/detect cross-protocol SMB relay paths**. 
 	* Remote registry being disabled can cause jank with `--ntlmv1-all`. Also very heavy and not OPSEC safe, but thorough. Probably not recommended unless you're YOLO'ing or desperate.

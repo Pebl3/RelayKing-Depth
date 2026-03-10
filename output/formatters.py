@@ -233,7 +233,7 @@ class PlaintextFormatter:
                         elif status.get('error') and 'Access denied (pipe exists)' in status.get('error', ''):
                             output.append(f"  [~] {vuln_name}: Pipe exists (access denied)")
 
-        return '\n'.join(output)
+        return '\n'.join(output) + '\n'
 
 
 class JSONFormatter:
