@@ -201,11 +201,15 @@ class GhostSPNDetector:
                         continue
                     raise
 
-        # NTLM password auth via ldap3
+        # NTLM password auth via ldap3.
+        # ldap3's NTLM does not include channel binding tokens (CBT), so when the DC
+        # enforces channel binding (80090346) even over LDAPS, fall back to impacket
+        # which correctly negotiates CBT via ldaps://.
         import ssl
         from ldap3 import Server, Connection, NTLM, ALL, Tls
 
         user = f"{self.config.domain}\\{self.config.username}"
+        cbt_blocked = False
         for use_ssl, port in ([(True, 636)] if use_ldaps else [(False, 389), (True, 636)]):
             tls_config = Tls(validate=ssl.CERT_NONE) if use_ssl else None
             server = Server(dc_ip, port=port, use_ssl=use_ssl, tls=tls_config, get_info=ALL)
@@ -217,11 +221,27 @@ class GhostSPNDetector:
             conn.bind()
             if conn.result.get('result') == 0:
                 return conn, False, search_base
+            result_desc = conn.result.get('description', '')
             result_msg = conn.result.get('message', '')
-            if '80090346' in result_msg and not use_ssl:
-                conn.unbind()
+            conn.unbind()
+            if '80090346' in result_msg or '00002028' in result_msg:
+                cbt_blocked = True
                 continue
-            raise Exception(f"LDAP bind failed: {conn.result.get('description')} - {result_msg}")
+            raise Exception(f"LDAP bind failed: {result_desc} - {result_msg}")
+
+        if cbt_blocked:
+            from impacket.ldap import ldap as ldap_impacket
+            impacket_conn = ldap_impacket.LDAPConnection(
+                url=f"ldaps://{dc_ip}", baseDN=self.config.domain, dstIp=dc_ip
+            )
+            impacket_conn.login(
+                user=self.config.username,
+                password=self.config.password,
+                domain=self.config.domain or '',
+                lmhash='',
+                nthash=''
+            )
+            return impacket_conn, True, search_base
 
     def _check_wildcard_dns(self, conn, search_base: str, use_impacket: bool) -> bool:
         """Return True if any wildcard DNS entry exists in DomainDnsZones."""
