@@ -110,6 +110,18 @@ class PlaintextFormatter:
 
             output.append("")
 
+        # Ghost SPN reference note (full list is in the separate file)
+        ghost_spn = results.get('analysis', {}).get('ghost_spn', {})
+        if ghost_spn and not ghost_spn.get('error') and ghost_spn.get('output_file'):
+            total = ghost_spn.get('_total_findings', 0)
+            truncated = ghost_spn.get('_truncated', False)
+            spn_file = ghost_spn['output_file']
+            if truncated:
+                output.append(f"[*] Ghost SPN: {total} finding(s) found - first 5 shown above. Full list: {spn_file}")
+            else:
+                output.append(f"[*] Ghost SPN: {total} finding(s) found. Full details: {spn_file}")
+            output.append("")
+
         # Detailed results per host
         output.append("DETAILED HOST RESULTS")
         output.append("=" * 80)

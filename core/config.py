@@ -4,6 +4,7 @@ Command-line argument parsing and configuration management
 """
 
 import argparse
+import os
 from dataclasses import dataclass
 from typing import Optional, List, Set
 
@@ -43,12 +44,16 @@ class RelayKingConfig:
     coerce_target: Optional[str] = None  # Listener IP for coercion attacks
     coerce_timeout: int = 3  # Timeout for coercion checks (default 3 seconds)
     null_auth: bool = False
+    no_ghosts: bool = False  # Skip Ghost SPN check even in --audit mode
 
     # Output options
     output_formats: List[str] = None  # List of output formats (plaintext, json, xml, csv, grep, markdown)
     output_file: Optional[str] = None
     gen_relay_list: Optional[str] = None  # Output file for NTLMRelayX relay targets
     verbose: int = 0
+
+    # Session resume
+    session_resume: Optional[str] = None  # Path to .resume file for resuming interrupted scans
 
     # Performance
     threads: int = 10
@@ -194,6 +199,8 @@ Examples:
                              help='Audit mode: enumerate all computers from Active Directory. Requires low-priv AD creds and proper DNS config. Default protocols: smb, ldap, ldaps, mssql. Adding http,https enables tier-0 HTTP relay path analysis.')
     target_group.add_argument('--no-ping', action='store_true',
                              help='Skip ping sweep for CIDR ranges (scan all IPs). Useful when using SOCKS proxies where ICMP is not supported.')
+    target_group.add_argument('--session-resume', metavar='FILE',
+                             help='Resume an interrupted --audit scan from a .resume session file. Skips AD enumeration, DNS resolution, and port scanning for already-completed work.')
 
     # Detection options
     detection_group = parser.add_argument_group('Detection Options')
@@ -215,6 +222,8 @@ Examples:
                                 help='Timeout for coercion checks in seconds (default: 3)')
     detection_group.add_argument('--null-auth', action='store_true',
                                 help='Attempt null/anonymous authentication')
+    detection_group.add_argument('--no-ghosts', action='store_true',
+                                help='Skip Ghost SPN relay check (only runs in --audit mode by default)')
 
     # Output options
     output_group = parser.add_argument_group('Output Options')
@@ -252,8 +261,12 @@ Examples:
             if not (args.kerberos and args.no_pass):
                 parser.error('Password (-p), hashes (--hashes), or --aesKey required unless using --null-auth or -k/--kerberos with --no-pass')
 
-    if not args.target and not args.target_file and not args.audit and not args.coerce_all:
-        parser.error('Must specify targets, --target-file, --audit mode, or --coerce-all')
+    if not args.target and not args.target_file and not args.audit and not args.coerce_all and not args.session_resume:
+        parser.error('Must specify targets, --target-file, --audit mode, --coerce-all, or --session-resume')
+
+    if args.session_resume:
+        if not os.path.isfile(args.session_resume):
+            parser.error(f'Session file not found: {args.session_resume}')
 
     if args.audit and not args.domain:
         parser.error('--audit mode requires domain (-d)')
@@ -338,10 +351,12 @@ Examples:
         coerce_target=args.coerce_target if hasattr(args, 'coerce_target') else None,
         coerce_timeout=args.coerce_timeout,
         null_auth=args.null_auth,
+        no_ghosts=args.no_ghosts,
         output_formats=output_formats,
         output_file=args.output_file,
         gen_relay_list=args.gen_relay_list,
         verbose=args.verbose,
+        session_resume=args.session_resume,
         threads=args.threads,
         timeout=args.timeout,
         max_scangroup=args.max_scangroup,

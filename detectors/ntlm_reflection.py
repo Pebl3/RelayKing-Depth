@@ -36,6 +36,20 @@ class NTLMReflectionDetector:
         (10, 0, 26100): 6584,     # Windows Server 2025 / Windows 11 24H2 (CVE-2025-54918)
     }
 
+    # Minimum patched UBR for CVE-2019-1040 (Drop the MIC)
+    # https://msrc.microsoft.com/update-guide/vulnerability/CVE-2019-1040
+    # Patched by June 11, 2019 Patch Tuesday cumulative updates
+    CVE_2019_1040_PATCHES = {   # key = (major, minor, build), value = minimum patched UBR
+        (10, 0, 10240): 18244,   # Windows 10 1507 (KB4503291)
+        (10, 0, 14393): 3025,    # Windows Server 2016 / Win10 1607 (KB4503267)
+        (10, 0, 15063): 1868,    # Windows 10 1703 (KB4503279)
+        (10, 0, 16299): 1217,    # Windows 10 1709 (KB4503284)
+        (10, 0, 17134): 829,     # Windows 10 1803 (KB4503286)
+        (10, 0, 17763): 557,     # Windows Server 2019 / Win10 1809 (KB4503327)
+        (10, 0, 18362): 175,     # Windows 10 1903 (KB4503293)
+        # Builds >= 18363 (Win10 1909+) shipped after June 2019 patch - not affected
+    }
+
     def __init__(self, config):
         self.config = config
 
@@ -145,32 +159,46 @@ class NTLMReflectionDetector:
         if self.config.verbose >= 2:
             print(f"[*] NTLM reflection check for {target}: version=({major}, {minor or 0}, {build}), ubr={ubr}, vulnerable={is_vulnerable}")
 
-        # Special check for Server 2025 DCs with PrintSpooler (CVE-2025-54918)
-        # Only check if:
-        # 1. This is a Domain Controller
-        # 2. OS is Server 2025 (build 26100)
-        # 3. UBR < 6584 (unpatched for CVE-2025-54918)
-        if self.config.is_dc(target) and major == 10 and minor == 0 and build == 26100 and ubr < 6584:
-            if self.config.verbose >= 2:
-                print(f"[*] Detected Server 2025 DC (build {build}.{ubr}) - checking PrintSpooler for CVE-2025-54918")
+        # CVE-2025-54918: any unpatched Server 2025 host is at least MEDIUM.
+        # If it is also a DC with PrintSpooler enabled → CRITICAL.
+        if major == 10 and minor == 0 and build == 26100 and ubr < 6584:
+            is_dc = self.config.is_dc(target)
+            printspooler_enabled = False
 
-            # Check if PrintSpooler is enabled
-            printspooler_enabled = self._check_printspooler_enabled(target)
-
-            if printspooler_enabled:
-                # Store CVE-2025-54918 vulnerability in result for relay_analyzer to use
-                result['cve_2025_54918'] = {
-                    'vulnerable': True,
-                    'is_dc': True,
-                    'build': f"{major}.{minor}.{build}.{ubr}",
-                    'printspooler_enabled': True
-                }
-
-                if self.config.verbose >= 1:
-                    print(f"[!] {target} is vulnerable to CVE-2025-54918 (Server 2025 DC with PrintSpooler enabled)")
+            if is_dc:
+                if self.config.verbose >= 2:
+                    print(f"[*] CVE-2025-54918: Server 2025 DC detected on {target} (build {build}.{ubr}) - checking PrintSpooler")
+                printspooler_enabled = self._check_printspooler_enabled(target)
+                if self.config.verbose >= 2:
+                    state = "enabled" if printspooler_enabled else "not enabled/accessible"
+                    print(f"[*] CVE-2025-54918: PrintSpooler on {target} is {state}")
             else:
                 if self.config.verbose >= 2:
-                    print(f"[*] {target} is Server 2025 DC but PrintSpooler is not enabled/accessible")
+                    print(f"[*] CVE-2025-54918: Server 2025 non-DC host {target} (build {build}.{ubr}) is unpatched")
+
+            result['cve_2025_54918'] = {
+                'vulnerable': True,
+                'is_dc': is_dc,
+                'build': f"{major}.{minor}.{build}.{ubr}",
+                'printspooler_enabled': printspooler_enabled,
+            }
+
+            if self.config.verbose >= 1:
+                if is_dc and printspooler_enabled:
+                    print(f"[!] {target}: CVE-2025-54918 CRITICAL - Server 2025 DC with PrintSpooler enabled (build {build}.{ubr})")
+                else:
+                    role = "DC" if is_dc else "host"
+                    print(f"[!] {target}: CVE-2025-54918 MEDIUM - Server 2025 {role} unpatched (build {build}.{ubr})")
+
+        # CVE-2019-1040 (Drop the MIC): check all Windows hosts against patch table
+        cve_1040_vulnerable = self._is_vulnerable_cve2019_1040(major, minor or 0, build, ubr)
+        if cve_1040_vulnerable:
+            result['cve_2019_1040'] = {
+                'vulnerable': True,
+                'build': f"{major}.{minor or 0}.{build}.{ubr}",
+            }
+            if self.config.verbose >= 1:
+                print(f"[!] {target}: CVE-2019-1040 (Drop the MIC) - Windows {major}.{minor or 0}.{build}.{ubr} is unpatched")
 
         if is_vulnerable:
             result['vulnerable'] = True
@@ -450,4 +478,19 @@ class NTLMReflectionDetector:
         if ubr is None:
             return None
 
+        return ubr < min_patched_ubr
+
+    def _is_vulnerable_cve2019_1040(self, major: int, minor: int, build: int, ubr: int) -> bool:
+        """
+        Check if Windows version is vulnerable to CVE-2019-1040 (Drop the MIC).
+
+        Returns:
+            True if vulnerable, False if patched or unknown build
+        """
+        if ubr is None:
+            return False
+        key = (major, minor, build)
+        min_patched_ubr = self.CVE_2019_1040_PATCHES.get(key)
+        if min_patched_ubr is None:
+            return False  # Unknown or not in affected range
         return ubr < min_patched_ubr

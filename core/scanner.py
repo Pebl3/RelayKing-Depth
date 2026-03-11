@@ -5,6 +5,7 @@ Main scanning orchestration and coordination
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List
+import os
 import sys
 import socket
 
@@ -34,6 +35,7 @@ from detectors.webdav_detector import WebDAVDetector
 from detectors.ntlm_reflection import NTLMReflectionDetector
 from detectors.ntlmv1_detector import NTLMv1Detector
 from detectors.coercion import CoercionDetector
+from detectors.ghost_spn import GhostSPNDetector
 
 
 class RelayKingScanner:
@@ -63,19 +65,22 @@ class RelayKingScanner:
         'winrms': (WINRMSDetector, 5986),
     }
 
-    def __init__(self, config):
+    def __init__(self, config, session=None):
         self.config = config
         self.target_parser = TargetParser(config)
         # RelayAnalyzer is initialized later after target parsing to get tier-0 assets
         self.relay_analyzer = None
         self.cred_checker = CredentialChecker(config)
         self.all_targets = []
+        self.session = session  # SessionManager instance (or None)
+        # Ghost SPN results cached here so the AD query only fires once across multi-group scans
+        self._ghost_spn_results = None
 
     def prepare(self) -> Dict:
         """
         Prepare for scan
             - check credential
-            - prepare target list
+            - prepare target list (or load from session)
 
         Returns:
             dict with status, details and number_of_target
@@ -93,7 +98,43 @@ class RelayKingScanner:
         else:
             print("[*] Given credential looks valid. Good to move forward")
 
-        # Parse targets
+        # If resuming from session, load targets instead of re-enumerating
+        if self.session and self.config.session_resume:
+            phase = self.session.get_phase()
+            print(f"[*] Resuming from session file (phase: {phase})")
+
+            # Load targets from session
+            self.all_targets = self.session.get_targets()
+
+            # Restore tier-0 assets and DC hostnames
+            self.target_parser.tier0_assets = self.session.get_tier0_assets()
+            dc_hostnames = self.session.get_dc_hostnames()
+            if dc_hostnames:
+                self.config.set_dc_hostnames(dc_hostnames)
+
+            if self.target_parser.tier0_assets:
+                print(f"[+] Restored {len(self.target_parser.tier0_assets)} tier-0 asset(s) from session")
+            if dc_hostnames:
+                print(f"[+] Restored {len(dc_hostnames)} DC hostname(s) from session")
+
+            completed = self.session.get_completed_hosts()
+            print(f"[+] Restored {len(self.all_targets)} target(s) from session ({len(completed)} already scanned)")
+
+            if not self.all_targets:
+                print("[!] No targets in session file")
+                return {
+                    'status': "No target to scan",
+                    'details': "",
+                    'number_of_target': 0
+                }
+
+            return {
+                'status': "Success",
+                'details': "",
+                'number_of_target': len(self.all_targets)
+            }
+
+        # Normal flow: parse targets from scratch
         print("[*] Parsing targets...")
         self.all_targets = self.target_parser.parse_targets()
 
@@ -104,6 +145,13 @@ class RelayKingScanner:
                 'details': "",
                 'number_of_target': 0
             }
+
+        # Save to session if active (--audit creates session automatically)
+        if self.session:
+            self.session.set_targets(self.all_targets)
+            self.session.set_tier0_assets(self.target_parser.tier0_assets)
+            self.session.set_dc_hostnames(self.config._dc_hostnames)
+            self.session.set_phase('targets_ready')
 
         print(f"[+] Found {len(self.all_targets)} target(s)")
         return {
@@ -132,6 +180,24 @@ class RelayKingScanner:
         analysis = self.relay_analyzer.skeleton()
         all_results = {}
 
+        # If resuming, load previously completed host results for this group
+        completed_hosts_in_session = set()
+        if self.session and self.config.session_resume:
+            completed_hosts_in_session = self.session.get_completed_hosts()
+            restored = self.session.get_completed_host_results()
+            # Only restore results for hosts in this group's target range
+            for target in targets:
+                if target in restored:
+                    all_results[target] = restored[target]
+
+            remaining = [t for t in targets if t not in completed_hosts_in_session]
+            if remaining:
+                print(f"[*] Resuming: {len(targets) - len(remaining)} hosts restored from session, {len(remaining)} remaining")
+            else:
+                print(f"[*] All {len(targets)} hosts in this group already scanned (from session)")
+        else:
+            remaining = list(targets)
+
         try:
 
             # Determine which protocols to scan
@@ -156,21 +222,47 @@ class RelayKingScanner:
             # Fast port scan if --proto-portscan enabled
             port_scan_results = {}
             if self.config.proto_portscan:
-                print("[*] Running fast port scan...")
-                port_scanner = FastPortScanner(timeout=0.1)  # 100ms timeout
+                # If resuming and we have port scan results from session, use those
+                if self.session and self.config.session_resume:
+                    session_port_results = self.session.get_port_scan_results()
+                    if session_port_results:
+                        # Use session results for already-scanned hosts, scan the rest
+                        hosts_needing_portscan = [t for t in remaining if t not in session_port_results]
+                        # Restore session results for all known hosts in this group
+                        for target in targets:
+                            if target in session_port_results:
+                                port_scan_results[target] = session_port_results[target]
 
-                # Determine which protocols to port scan
-                # Always include HTTP/HTTPS ports when tier-0 assets exist (for ADCS/SCCM detection)
-                protocols_for_portscan = protocols.copy()
-                if self.target_parser.tier0_assets:
-                    # Add HTTP/HTTPS to port scan for tier-0 asset detection
-                    if 'http' not in protocols_for_portscan:
-                        protocols_for_portscan.append('http')
-                    if 'https' not in protocols_for_portscan:
-                        protocols_for_portscan.append('https')
+                        if hosts_needing_portscan:
+                            print(f"[*] Running fast port scan on {len(hosts_needing_portscan)} new hosts ({len(targets) - len(hosts_needing_portscan)} restored from session)...")
+                            port_scanner = FastPortScanner(timeout=0.1)
+                            protocols_for_portscan = protocols.copy()
+                            if self.target_parser.tier0_assets:
+                                if 'http' not in protocols_for_portscan:
+                                    protocols_for_portscan.append('http')
+                                if 'https' not in protocols_for_portscan:
+                                    protocols_for_portscan.append('https')
+                            new_port_results = port_scanner.scan_hosts(hosts_needing_portscan, protocols_for_portscan, threads=50)
+                            port_scan_results.update(new_port_results)
 
-                # First pass: scan all targets for base protocols
-                port_scan_results = port_scanner.scan_hosts(targets, protocols_for_portscan, threads=50)
+                            # Save new port scan results to session
+                            if self.session:
+                                self.session.set_port_scan_results(port_scan_results)
+                                self.session.save()
+                        else:
+                            print(f"[+] Port scan results restored from session for all hosts")
+                    else:
+                        # No port scan results in session - scan from scratch
+                        port_scan_results = self._run_port_scan(remaining, protocols)
+                        if self.session:
+                            self.session.set_port_scan_results(port_scan_results)
+                            self.session.save()
+                else:
+                    port_scan_results = self._run_port_scan(targets, protocols)
+                    # Save port scan results to session
+                    if self.session:
+                        self.session.set_port_scan_results(port_scan_results)
+                        self.session.set_phase('port_scan_complete')
 
                 # Count open ports
                 total_open = sum(len(ports) for ports in port_scan_results.values())
@@ -178,61 +270,80 @@ class RelayKingScanner:
                 print(f"[+] Port scan complete: {total_open} open ports across {hosts_with_open} hosts")
                 print()
 
-            # Scan all targets
+            # Scan remaining targets (skip already-completed hosts)
+            if remaining:
+                if self.session:
+                    self.session.set_phase('scanning')
 
-            with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
-                # Submit all scan tasks
-                future_to_target = {}
+                with ThreadPoolExecutor(max_workers=self.config.threads) as executor:
+                    # Submit all scan tasks
+                    future_to_target = {}
 
-                for target in targets:
-                    future = executor.submit(self._scan_target, target, protocols, port_scan_results)
-                    future_to_target[future] = target
+                    for target in remaining:
+                        future = executor.submit(self._scan_target, target, protocols, port_scan_results)
+                        future_to_target[future] = target
 
-                # Process results as they complete
-                completed = 0
-                for future in as_completed(future_to_target):
-                    target = future_to_target[future]
-                    completed += 1
+                    # Process results as they complete
+                    completed = 0
+                    total_to_scan = len(remaining)
+                    for future in as_completed(future_to_target):
+                        target = future_to_target[future]
+                        completed += 1
 
-                    try:
-                        result = future.result()
+                        try:
+                            result = future.result()
 
-                        # Resolve target IP and add to results
-                        resolved_ips = self._resolve_target_ip(target)
-                        result['_target_ips'] = resolved_ips  # Store IPs with underscore prefix to mark as metadata
+                            # Resolve target IP and add to results
+                            resolved_ips = self._resolve_target_ip(target)
+                            result['_target_ips'] = resolved_ips  # Store IPs with underscore prefix to mark as metadata
 
-                        all_results[target] = result
+                            all_results[target] = result
 
-                        # Print progress
-                        if self.config.verbose >= 1:
-                            # Check if any protocol was actually available
-                            has_available = any(
-                                hasattr(pr, 'available') and pr.available
-                                for pr in result.values()
-                                if not isinstance(pr, dict)
-                            )
+                            # Save to session (periodic flush handles disk writes)
+                            if self.session:
+                                self.session.mark_host_complete(target, result)
+                                self.session.save_if_needed()
 
-                            if has_available:
-                                # Only show status if we could actually connect
-                                relayable = any(
-                                    pr.is_relayable() for pr in result.values()
-                                    if hasattr(pr, 'is_relayable')
+                            # Print progress
+                            if self.config.verbose >= 1:
+                                # Check if any protocol was actually available
+                                has_available = any(
+                                    hasattr(pr, 'available') and pr.available
+                                    for pr in result.values()
+                                    if not isinstance(pr, dict)
                                 )
-                                status = "RELAYABLE" if relayable else "PROTECTED"
-                                print(f"[{completed}/{len(targets)}] {target}: {status}")
+
+                                if has_available:
+                                    # Show per-host status whenever we could connect
+                                    relayable = any(
+                                        pr.is_relayable() for pr in result.values()
+                                        if hasattr(pr, 'is_relayable')
+                                    )
+                                    status = "RELAYABLE" if relayable else "PROTECTED"
+                                    print(f"[{completed}/{total_to_scan}] {target}: {status}")
+                                elif self.config.verbose >= 3:
+                                    # -vvv: show every host, even offline/unreachable ones
+                                    print(f"[{completed}/{total_to_scan}] {target}: OFFLINE")
+                                else:
+                                    # -v / -vv: keep a rolling counter so the scan looks alive
+                                    sys.stdout.write(f"\r[*] Progress: {completed}/{total_to_scan}")
+                                    sys.stdout.flush()
                             else:
-                                # Skip hosts where we couldn't connect to any protocol
-                                pass
-                        else:
-                            sys.stdout.write(f"\r[*] Progress: {completed}/{len(targets)}")
-                            sys.stdout.flush()
+                                sys.stdout.write(f"\r[*] Progress: {completed}/{total_to_scan}")
+                                sys.stdout.flush()
 
-                    except Exception as e:
-                        if self.config.verbose >= 1:
-                            print(f"[!] Error scanning {target}: {e}")
+                        except Exception as e:
+                            if self.config.verbose >= 1:
+                                print(f"[!] Error scanning {target}: {e}")
 
-            if self.config.verbose == 0:
-                print()  # Newline after progress
+                # Newline after the rolling counter (used at verbose=0, and at verbose=1/2
+                # for non-responding hosts; not needed at verbose>=3 which uses print())
+                if self.config.verbose < 3:
+                    print()
+
+                # Final session flush after scanning completes
+                if self.session:
+                    self.session.save()
 
             # Check for NTLMv1 support first (before analysis)
             ntlmv1_analysis = None
@@ -248,7 +359,47 @@ class RelayKingScanner:
                 print("[*] Checking for coercion vulnerabilities...")
                 analysis['coercion'] = self._check_coercion(targets)
 
+            # Ghost SPN check: --audit mode only, with credentials, and unless --no-ghosts suppresses it.
+            # Results are cached on the scanner instance so the AD query only fires once even when
+            # the scan is divided into multiple groups (--max-scangroup / --split-into).
+            if (self.config.audit_mode and not self.config.no_ghosts
+                    and not self.config.null_auth
+                    and (self.config.dc_ip or self.config.domain)):
+                if self._ghost_spn_results is None:
+                    # First group: run the AD query and write the findings file
+                    print("[*] Checking for Ghost SPN relay vulnerabilities...")
+                    self._ghost_spn_results = self._check_ghost_spn()
+                    if self._ghost_spn_results.get('error'):
+                        if self.config.verbose >= 2:
+                            print(f"[!] Ghost SPN check failed: {self._ghost_spn_results['error']}")
+                    else:
+                        vuln = len(self._ghost_spn_results.get('vulnerable', []))
+                        prob = len(self._ghost_spn_results.get('probably_vulnerable', []))
+                        checked = self._ghost_spn_results.get('checked', 0)
+                        print(f"[+] Ghost SPN: {checked} SPN hostname(s) checked, {vuln} vulnerable, {prob} probably vulnerable")
+                        if vuln or prob:
+                            # Place the findings file alongside --output-file if specified,
+                            # otherwise fall back to the working directory
+                            if self.config.output_file:
+                                output_dir = os.path.dirname(os.path.abspath(self.config.output_file))
+                                ghost_spn_file = os.path.join(output_dir, 'possible-ghost-spns.txt')
+                            else:
+                                ghost_spn_file = 'possible-ghost-spns.txt'
+                            self._write_ghost_spn_file(self._ghost_spn_results, ghost_spn_file)
+                            self._ghost_spn_results['output_file'] = ghost_spn_file
+
+                # Every group gets the cached results injected so Ghost SPN paths and the
+                # file reference appear in each group's output (they are domain-wide findings)
+                if not self._ghost_spn_results.get('error'):
+                    if self._ghost_spn_results.get('vulnerable') or self._ghost_spn_results.get('probably_vulnerable'):
+                        self.relay_analyzer.add_ghost_spn_paths(analysis, self._ghost_spn_results)
+                analysis['ghost_spn'] = self._ghost_spn_results
+
         except KeyboardInterrupt:
+            # Flush session before exiting so progress is saved
+            if self.session:
+                print("\n[*] Saving session progress...")
+                self.session.save()
             print("\n[!] Scan interrupted by user")
 
         # Compile final results
@@ -260,6 +411,73 @@ class RelayKingScanner:
         }
 
         return final_results
+
+    def _check_ghost_spn(self) -> dict:
+        """Check for Ghost SPN relay vulnerabilities in Active Directory."""
+        try:
+            detector = GhostSPNDetector(self.config)
+            return detector.detect()
+        except Exception as e:
+            if self.config.verbose >= 2:
+                print(f"[!] Ghost SPN check error: {e}")
+            return {'error': str(e), 'vulnerable': [], 'probably_vulnerable': [], 'checked': 0}
+
+    def _write_ghost_spn_file(self, ghost_spn_results: dict, filename: str):
+        """Write all Ghost SPN findings to a plaintext file."""
+        vulnerable = ghost_spn_results.get('vulnerable', [])
+        probably_vulnerable = ghost_spn_results.get('probably_vulnerable', [])
+
+        lines = []
+        lines.append("=" * 80)
+        lines.append("RelayKing - Ghost SPN Findings")
+        lines.append("=" * 80)
+        lines.append(f"Total SPN hostnames checked : {ghost_spn_results.get('checked', 0)}")
+        lines.append(f"Vulnerable (no DNS record)  : {len(vulnerable)}")
+        lines.append(f"Probably vulnerable (wildcard DNS): {len(probably_vulnerable)}")
+        lines.append("")
+
+        if vulnerable:
+            lines.append("VULNERABLE - No DNS record (hostname is unregistered)")
+            lines.append("-" * 80)
+            for f in vulnerable:
+                lines.append(f"  Account  : {f.get('account', '')}")
+                lines.append(f"  SPN      : {f.get('spn', '')}")
+                lines.append(f"  Hostname : {f.get('hostname', '')}")
+                lines.append(f"  Action   : Register DNS '{f.get('hostname', '')}' to intercept auth")
+                lines.append("")
+
+        if probably_vulnerable:
+            lines.append("PROBABLY VULNERABLE - Resolves via wildcard DNS")
+            lines.append("-" * 80)
+            for f in probably_vulnerable:
+                resolved = ', '.join(f.get('resolved_to', []))
+                lines.append(f"  Account    : {f.get('account', '')}")
+                lines.append(f"  SPN        : {f.get('spn', '')}")
+                lines.append(f"  Hostname   : {f.get('hostname', '')}")
+                lines.append(f"  Resolves to: {resolved}")
+                lines.append("")
+
+        try:
+            with open(filename, 'w') as fh:
+                fh.write('\n'.join(lines))
+            print(f"[+] Ghost SPN findings written to: {filename}")
+        except Exception as e:
+            print(f"[!] Could not write Ghost SPN file '{filename}': {e}")
+
+    def _run_port_scan(self, targets, protocols):
+        """Run fast port scan on targets and return results."""
+        print(f"[*] Running fast port scan...")
+        port_scanner = FastPortScanner(timeout=0.1)  # 100ms timeout
+
+        # Determine which protocols to port scan
+        protocols_for_portscan = protocols.copy()
+        if self.target_parser.tier0_assets:
+            if 'http' not in protocols_for_portscan:
+                protocols_for_portscan.append('http')
+            if 'https' not in protocols_for_portscan:
+                protocols_for_portscan.append('https')
+
+        return port_scanner.scan_hosts(targets, protocols_for_portscan, threads=50)
 
     def _coerce_all_mode(self, start_idx, end_idx) -> Dict:
         """

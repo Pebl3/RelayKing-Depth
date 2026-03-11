@@ -9,6 +9,7 @@ import time
 from core.banner import print_banner
 from core.config import parse_arguments
 from core.scanner import RelayKingScanner
+from core.session import SessionManager
 from output.formatters import OutputFormatter
 import os
 import math
@@ -110,6 +111,40 @@ def main():
     # Create and run scanner
     results = {}
 
+    # ── Session setup ────────────────────────────────────────
+    session = None
+    resuming = False
+
+    if config.session_resume:
+        # Load existing session
+        try:
+            session = SessionManager.load(config.session_resume)
+            resuming = True
+            print(f"[+] Loaded session file: {config.session_resume}")
+
+            # Restore output config from session so we append to the original files
+            session_output_file = session.get_output_file()
+            session_output_formats = session.get_output_formats()
+            session_gen_relay_list = session.get_gen_relay_list()
+
+            if session_output_file and not config.output_file:
+                config.output_file = session_output_file
+                print(f"[+] Restored output file from session: {config.output_file}")
+            if session_output_formats and config.output_formats == ['plaintext']:
+                config.output_formats = session_output_formats
+                print(f"[+] Restored output formats from session: {', '.join(config.output_formats)}")
+            if session_gen_relay_list and not config.gen_relay_list:
+                config.gen_relay_list = session_gen_relay_list
+                print(f"[+] Restored relay list file from session: {config.gen_relay_list}")
+
+        except Exception as e:
+            print(f"[!] Error loading session file: {e}")
+            return 1
+    elif config.audit_mode:
+        # Create new session for --audit runs
+        session = SessionManager()
+        print(f"[*] Session file will be saved to: {session.session_file}")
+
     try:
         # Start timer
         start_time = time.time()
@@ -121,12 +156,13 @@ def main():
             relay_list_fname = config.gen_relay_list
             base_path = os.path.dirname(os.path.abspath(relay_list_fname))
             os.makedirs(base_path, exist_ok=True)
-            try:
-                with open(relay_list_fname, 'w') as f:
-                    pass
-            except Exception as e:
-                print(f"\n[!] Error writing {relay_list_fname}: {e}")
-                ready_to_output = False
+            if not resuming:
+                try:
+                    with open(relay_list_fname, 'w') as f:
+                        pass
+                except Exception as e:
+                    print(f"\n[!] Error writing {relay_list_fname}: {e}")
+                    ready_to_output = False
 
         # Write to file or stdout
         if config.output_file:
@@ -135,35 +171,39 @@ def main():
             base_path = os.path.dirname(os.path.abspath(base_name))
             os.makedirs(base_path, exist_ok=True)
 
-            characters = string.ascii_letters + string.digits
-            random_string = "".join(random.choice(characters) for _ in range(10))
-            output_path = base_name + "_" + random_string
-            print(f"Testing log file creation with filename '{output_path}' ... ")
-            try:
-                with open(output_path, 'w') as f:
-                    f.write("check")
-                print(f"Success. Deleting it ... ")
-                os.remove(output_path)
-                print(f"Done.")
-            except Exception as e:
-                    print(f"\n[!] Error writing {output_path}: {e}")
-                    ready_to_output = False
+            if not resuming:
+                characters = string.ascii_letters + string.digits
+                random_string = "".join(random.choice(characters) for _ in range(10))
+                output_path = base_name + "_" + random_string
+                print(f"Testing log file creation with filename '{output_path}' ... ")
+                try:
+                    with open(output_path, 'w') as f:
+                        f.write("check")
+                    print(f"Success. Deleting it ... ")
+                    os.remove(output_path)
+                    print(f"Done.")
+                except Exception as e:
+                        print(f"\n[!] Error writing {output_path}: {e}")
+                        ready_to_output = False
         else:
-            # Only print to stdout if single format (avoid mixed output)
-            if len(config.output_formats) == 1:
-                print("\n" + formatted_output)
-            else:
-                print(f"\n[!] Multiple formats specified but no --output-file provided")
-                print(f"[!] Use --output-file to save outputs to files")
-                ready_to_output = False
+            if not resuming:
+                # Only stdout output is supported for a single format; multiple formats require a file
+                if len(config.output_formats) != 1:
+                    print(f"\n[!] Multiple formats specified but no --output-file provided")
+                    print(f"[!] Use --output-file to save outputs to files")
+                    ready_to_output = False
 
         if(ready_to_output == False):
             print("Cannot generate output file - we should not resume")
             return
 
-        scanner = RelayKingScanner(config)
+        # Save output config to session for future resume
+        if session and not resuming:
+            session.set_output_config(config.output_file, config.output_formats, config.gen_relay_list)
+
+        scanner = RelayKingScanner(config, session=session)
         status = scanner.prepare()
-        
+
         # grouping
         print(f"hosts: {status['number_of_target']} / max_scangroup: {config.max_scangroup} / split_into: {config.split_into} / skip: {config.skip}")
 
@@ -187,7 +227,10 @@ def main():
             else:
                 idxlen = int(math.log10(split_into-1))+1
 
-        print(f"Targets splitted into {split_into} groups. Each group has {group_size} hosts. Totally {status['number_of_target']} targets to be scanned")
+        print(f"Targets have been split into {split_into} groups. Each group has {group_size} hosts. Totally {status['number_of_target']} targets to be scanned")
+
+        # Determine which groups to skip (session-completed or --skip)
+        completed_groups = session.get_completed_groups() if session else set()
 
         # Generate outputs for each format
         outputs_written = []
@@ -199,6 +242,10 @@ def main():
                 print(f"Skipping group {i}: Skip to group {config.skip}")
                 continue
 
+            if i in completed_groups:
+                print(f"Skipping group {i}: Already completed (from session)")
+                continue
+
             s_idx = i * group_size
             e_idx = (i+1) * group_size
             if(e_idx > status['number_of_target']):
@@ -206,29 +253,48 @@ def main():
 
             print(f"Group {i} of {split_into}: Scanning {group_size}(or less) hosts with index {s_idx} to {e_idx} of total {status['number_of_target']}")
             results = scanner.scan(s_idx, e_idx)
-            outputs_written += output_result(results, i, group_size, split_into, idxlen, config)
+            # Stamp elapsed time before formatting so the formatter can include it in the report
+            results['scan_duration'] = time.time() - start_time
+            outputs_written += output_result(results, i, group_size, split_into, idxlen, config, append=resuming)
+
+            # Mark group complete in session
+            if session:
+                session.mark_group_complete(i)
 
     except KeyboardInterrupt:
+        # Session is saved by scanner's KeyboardInterrupt handler
+        if session:
+            session.save()
         print("\n[!] Scan interrupted by user")
+        if session:
+            print(f"[*] Session saved to: {session.session_file}")
+            print(f"[*] Resume with: --session-resume {session.session_file}")
         return 130
     except Exception as e:
+        # Save session on unexpected errors too
+        if session:
+            session.save()
+            print(f"[*] Session saved to: {session.session_file}")
+            print(f"[*] Resume with: --session-resume {session.session_file}")
         print(f"\n[!] Fatal error: {e}")
         if config.verbose >= 2:
             import traceback
             traceback.print_exc()
         return 1
 
-    # Calculate elapsed time
+    # Mark session complete
+    if session:
+        session.set_phase('complete')
+
     elapsed_time = time.time() - start_time
-    results['scan_duration'] = elapsed_time
     # Report written files
     if outputs_written:
-        print(f"\n[+] Results written to:")
+        print(f"\n[+] Scan completed in {elapsed_time:.1f}s. Results written to:")
         for path in outputs_written:
             print(f"    - {path}")
 
 
-def output_result(results, loop_count, group_size, split_into, idxlen, config):
+def output_result(results, loop_count, group_size, split_into, idxlen, config, append=False):
     # Generate outputs for each format
     outputs_written = []
 
@@ -241,6 +307,10 @@ def output_result(results, loop_count, group_size, split_into, idxlen, config):
         'grep': '.grep',
         'markdown': '.md'
     }
+
+    # When resuming, append to existing files; otherwise write fresh
+    file_mode = 'a' if append else 'w'
+
     # Generate outputs for each format
     for output_format in config.output_formats:
         formatted_output = OutputFormatter.format(results, output_format)
@@ -257,7 +327,9 @@ def output_result(results, loop_count, group_size, split_into, idxlen, config):
             output_path = base_name + extension
 
             try:
-                with open(output_path, 'w') as f:
+                with open(output_path, file_mode) as f:
+                    if append:
+                        f.write('\n')  # Separator between resumed sections
                     f.write(formatted_output)
                 outputs_written.append(output_path)
             except Exception as e:

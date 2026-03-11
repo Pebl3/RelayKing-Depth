@@ -89,8 +89,16 @@ class TargetParser:
             self._parse_cidr(target)
 
         # Check for IP range (e.g., 192.168.1.1-254)
+        # Guard: only attempt range parsing if the part before the last dash
+        # is a valid IPv4 address - this prevents hyphenated hostnames like
+        # CTC-PS-CTX-FAS1.gmt.internal from being misidentified as ranges.
         elif '-' in target and '.' in target:
-            self._parse_range(target)
+            start_part = target.rsplit('-', 1)[0]
+            try:
+                ipaddress.ip_address(start_part)
+                self._parse_range(target)
+            except ValueError:
+                self.targets.add(target)  # Hyphenated hostname, not an IP range
 
         # Single host (IP or hostname)
         else:

@@ -1,4 +1,4 @@
-# RelayKing v1.0
+# RelayKing v1.1
 
 ### Dominate the domain. Relay to royalty.
 ![](RelayKing-Banner.png)
@@ -64,6 +64,9 @@ See the associated blog released on the Depth Security website for more details:
 
 ### Advanced Detection
 - **NTLM Reflection**: Identifies hosts vulnerable to NTLM reflection attacks (CVE-2025-33073)
+- **CVE-2025-54918**: Detects unpatched Windows Server 2025 hosts vulnerable to NTLM reflection via PrintSpooler RPC coercion to LDAPS. Reported as MEDIUM on any unpatched Server 2025 host; escalates to CRITICAL when the host is a DC with PrintSpooler enabled. Checked via UBR (Update Build Revision) queried from the registry.
+- **CVE-2019-1040 (Drop the MIC)**: Detects hosts with UBRs below the June 2019 patch threshold, enabling MIC field stripping for cross-protocol relay (SMB to LDAP/LDAPS) with ntlmrelayx's `--remove-mic`. Reported as HIGH. Uses the UBR already queried per-host, no additional network requests.
+- **Ghost SPN Detection**: In `--audit` mode, queries Active Directory for Service Principal Names whose hostnames have no DNS record. An attacker can register the missing DNS name to intercept NTLM authentication intended for that service principal. Findings are split into *vulnerable* (no DNS record at all) and *probably vulnerable* (resolves only via wildcard DNS). Reported as MEDIUM. Full findings written to `possible-ghost-spns.txt`. Suppress with `--no-ghosts`.
 - **WebDAV/WebClient**: Detects hosts with the WebDAV WebClient service running
 - **NTLMv1 Support**: Checks for NTLMv1 authentication support (individually or at GPO level)
 - **Coercion Vulnerabilities**: Detects unauthenticated (if specified) PetitPotam, PrinterBug, DFSCoerce
@@ -71,9 +74,12 @@ See the associated blog released on the Depth Security website for more details:
 ### Relay Path Analysis
 - Automatically identifies viable relay attack paths (Functioning, needs more work)
 - Prioritizes paths by impact (critical, high, medium, low)
-- Cross-protocol relay detection (requires `--ntlmv1`or `--ntlmv1-all` - cross-protocol detection only when confirmed Net-NTLMv1 usage discovered)
+- Cross-protocol relay detection (requires `--ntlmv1` or `--ntlmv1-all` - cross-protocol detection only when confirmed Net-NTLMv1 usage discovered)
 - NTLM reflection paths (including partial MIC removal paths/cross-protocol relay)
-- Severity rating logic is WIP, submit PRs for upgrades/improvements! Not 100% of situations/scenarios are accounted for currently - the goal is to cover all possible primitives. 
+- CVE-2025-54918 paths: MEDIUM on any unpatched Server 2025 host, CRITICAL on unpatched DC with PrintSpooler enabled
+- CVE-2019-1040 paths: HIGH, SMB-to-LDAP cross-protocol relay via MIC stripping (`--remove-mic`)
+- Ghost SPN paths: MEDIUM, up to 5 shown in the report with full output in `possible-ghost-spns.txt`
+- Severity rating logic is WIP, submit PRs for upgrades/improvements! Not 100% of situations/scenarios are accounted for currently - the goal is to cover all possible primitives.
 
 ###  Targeting Options
 - **Active Directory Audit `(--audit)`**: Enumerate all computers from AD via LDAP. Requires low-priv AD credentials and *functional DNS* within environment. Force with `--dc-ip` or edit `/etc/resolv.conf`. 
@@ -94,6 +100,7 @@ See the associated blog released on the Depth Security website for more details:
 - **Mass Coercion**: `--coerce-all` combined with `--audit` and low-priv creds to coerce EVERY domain machine for mass computer account relaying. Highly useful in environments with Net-NTLMv1 enabled.
 - **Net-NTLMv1 Discovery**: `--ntlmv1` or `--ntlmv1-all` to detect LanMan GPOs at domain level. `--ntlmv1-all` checks ALL hosts from AD and their registry values using RemoteRegistry. **(requires local admin)**.
 - **Relay List Generation**: `--gen-relay-list <file>` to produce a readily-importable target file for ntlmrelayx.py's `-tf` switch.
+- **Ghost SPN Check**: Automatically runs in `--audit` mode when credentials are present. Suppress with `--no-ghosts`. Full findings are written to `possible-ghost-spns.txt` alongside the main report; the report itself shows the first 5 to avoid clutter.
 - **Flexible Kerberos Auth Features**: Kerberos auth via -k (and a FQDN for `--dc-ip`) should work pretty nicely. If the environment has domain controllers that have NTLM disabled entirely but tolerate it everywhere else, you can use `--krb-dc-only` so it doesn't mess with any checks. Also, --dns-tcp and -ns are available for work conducted over SOCKS/other proxy pivots. Even kerb works in this scenario pretty easily.
 
 ## Installation
@@ -154,10 +161,13 @@ python3 relayking.py -u ‘lowpriv’ -p ‘lowpriv-password’ -d client.domain
 - You can specify `--split-into` to specify the number of groups. For example, `--split-into 3` will split 299 targets into 3 groups. Groups will have targets as 100, 100 and 99. You cannot specify both `--max-scangroup` and `--split-into` in same time.
 - You can specify `--skip` to skip groups. For example, `--max-scangroup 3 --skip 1` will split 299 targets into 3 groups as 100, 100 and 99 targets, and skip the first group then starts scanning from second group. It helps when you would like to restart this tool.
 ### Feature Behavior Notes:
-* `--ntlmv1` or -`-ntlmv1-all`: Adding `--ntlmv1` will pull every LanMan GPO for the domain and nothing else. Requires low-priv AD creds. `--ntlmv1-all` requires admin credentials and will check **every individual host in the domain** with SMB open for the LMCompatibilityLevel registry key. Running at least `--ntlmv1` **is required to show/detect cross-protocol SMB relay paths**. 
-	* Remote registry being disabled can cause jank with `--ntlmv1-all`. Also very heavy and not OPSEC safe, but thorough. Probably not recommended unless you're YOLO'ing or desperate.
+* `--ntlmv1` or `-ntlmv1-all`: Adding `--ntlmv1` will pull every LanMan GPO for the domain and nothing else. Requires low-priv AD creds. `--ntlmv1-all` requires admin credentials and will check **every individual host in the domain** with SMB open for the LMCompatibilityLevel registry key. Running at least `--ntlmv1` **is required to show/detect cross-protocol SMB relay paths**.
+	* Remote registry being disabled can cause jank with `--ntlmv1-all`. Also very heavy and not OPSEC safe, but thorough. Probably not recommended unless you’re YOLO’ing or desperate.
 * **Output in various formats**. Supplying formats in comma-separated notation (`-o json,plaintext`) and `--output-file relayking-scan` produces relayking-scan.json + relayking-scan.txt so there’s no need to run it twice for multiple formats. Available: `plaintext, json, xml, csv, grep, markdown` (**default: plaintext)**
-* `--coerce-all`functionality will use PetitPotam, DFSCoerce, and PrinterBug on ALL HOSTS TARGETED. It also mass-coerces every machine in the domain without running the full protocol audit. Supplying `--audit` + `--coerce` at the **same time** will perform a domain audit **AND** mass-coercion. (**HEAVY**)
+* `--coerce-all` functionality will use PetitPotam, DFSCoerce, and PrinterBug on ALL HOSTS TARGETED. It also mass-coerces every machine in the domain without running the full protocol audit. Supplying `--audit` + `--coerce` at the **same time** will perform a domain audit **AND** mass-coercion. (**HEAVY**)
+* **Ghost SPN** (`--audit` mode only): After the host scan completes, RelayKing queries AD for SPNs whose hostnames have no DNS record. These are candidates for DNS registration attacks that intercept NTLM authentication. The report includes up to 5 findings to keep output manageable; the full list is always written to `possible-ghost-spns.txt` in the working directory. Pass `--no-ghosts` to skip this check entirely.
+* **CVE-2025-54918**: Checked via the UBR (Update Build Revision) already read from each host’s registry during the scan. Unpatched Server 2025 hosts (build 26100, UBR < 6584) report MEDIUM. If the host is also a DC with PrintSpooler enabled, severity escalates to CRITICAL.
+* **CVE-2019-1040 (Drop the MIC)**: Also UBR-driven, no extra network traffic. Hosts below the June 2019 patch threshold are flagged HIGH and identified as candidates for cross-protocol relay with ntlmrelayx’s `--remove-mic` flag.
 
 ## To-Do
 
@@ -178,7 +188,7 @@ python3 relayking.py -u ‘lowpriv’ -p ‘lowpriv-password’ -d client.domain
 ## Submitting Issues/Pull Requests
 ### Issues
 * Issues opened containing errors/tool failures without any details ("this doesn't work"/"why no work") will be closed.
-* Generally speaking, run the tool with `-vv` or `-vvv` if you're experiencing errors. Logging isn't perfect in v1.0 - will improve in the future/as able.
+* Generally speaking, run the tool with `-vv` or `-vvv` if you're experiencing errors. Logging continues to improve with each version.
 * When submitting issues, as much detail as possible is highly desirable so debugging/troubleshooting is possible. Please redact any sensitive info from debugging output such as client/target domains, machine names, any other sensitive info. You don't want to leak your client's relay skeletons to the world.
 * Usage args that produced issues/errors/broken behavior are also necessary.
 * Issues that arise from user-error or broken, misconfigured environments will be reviewed, and likely closed. **Exceptions** to this are situations where the tool **SHOULD** gracefully handle an environment-specific quirk and it fails to run/throws exceptions+stack traces when encountered. These situations should be fairly obvious. Examples of user error/busted network setup below:
@@ -199,6 +209,7 @@ python3 relayking.py -u ‘lowpriv’ -p ‘lowpriv-password’ -d client.domain
 - **Garrett Foster (SpecterOps) (https://github.com/garrettfoster13) SCCMHunter**: SCCM detection logic. Lab-usage for testing (MANY THANKS!)
 - **Oliver Lyak (https://github.com/ly4k) Certipy-AD**: ADCS detection logic
 - **Andrea Pierini (https://github.com/decoder-it)**: Numerous relay techniques and tactics.
+- **p0dalirius (https://github.com/p0dalirius/GhostSPN)**: Ghost SPN detection concept and methodology.
 - Possibly more I'm missing - this tool wouldn't be possible without the greater infosec community and their contributions.
 ## Disclaimer
 

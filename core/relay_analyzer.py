@@ -239,22 +239,64 @@ class RelayAnalyzer:
                 )
                 paths.append(path)
 
-            # Check for CVE-2025-54918 (Server 2025 DC with PrintSpooler)
+            # Check for CVE-2025-54918 (unpatched Server 2025)
+            # CRITICAL: DC with PrintSpooler enabled (RPC coercion -> LDAPS reflection)
+            # MEDIUM:   any other unpatched Server 2025 host
             cve_54918 = reflection_result.get('cve_2025_54918')
             if cve_54918 and cve_54918.get('vulnerable'):
+                is_dc = cve_54918.get('is_dc', False)
+                spooler = cve_54918.get('printspooler_enabled', False)
+                build_str = cve_54918.get('build', '')
+
+                if is_dc and spooler:
+                    path = RelayPath(
+                        source_host=host,
+                        source_protocol='rpc',
+                        dest_host=host,
+                        dest_protocol='ldaps',
+                        impact=RelayImpact.CRITICAL,
+                        description=(
+                            f"CVE-2025-54918: Server 2025 DC with PrintSpooler enabled on {host} - "
+                            f"Coerce via RPC, reflect to LDAPS (bypasses channel binding). "
+                            f"Build {build_str} is unpatched."
+                        ),
+                        source_ips=host_ips,
+                        dest_ips=host_ips,
+                    )
+                else:
+                    role = "DC (PrintSpooler not confirmed)" if is_dc else "non-DC host"
+                    path = RelayPath(
+                        source_host=host,
+                        source_protocol='any',
+                        dest_host=host,
+                        dest_protocol='any',
+                        impact=RelayImpact.MEDIUM,
+                        description=(
+                            f"CVE-2025-54918: Server 2025 {role} on {host} is unpatched "
+                            f"(build {build_str}) - vulnerable to NTLM reflection."
+                        ),
+                        source_ips=host_ips,
+                        dest_ips=host_ips,
+                    )
+                paths.append(path)
+
+            # Check for CVE-2019-1040 (Drop the MIC) - HIGH severity relay risk
+            cve_1040 = reflection_result.get('cve_2019_1040')
+            if cve_1040 and cve_1040.get('vulnerable'):
+                build_str = cve_1040.get('build', '')
                 path = RelayPath(
                     source_host=host,
-                    source_protocol='rpc',
+                    source_protocol='smb',
                     dest_host=host,
-                    dest_protocol='ldaps',
-                    impact=RelayImpact.CRITICAL,
+                    dest_protocol='ldap',
+                    impact=RelayImpact.HIGH,
                     description=(
-                        f"CVE-2025-54918: Server 2025 DC with PrintSpooler enabled on {host} - "
-                        f"Coerce authentication via RPC and reflect to LDAPS (bypasses channel binding). "
-                        f"Build {cve_54918.get('build')} is unpatched."
+                        f"CVE-2019-1040 (Drop the MIC): {host} running Windows {build_str} is unpatched - "
+                        f"MIC can be stripped from NTLM messages enabling cross-protocol relay "
+                        f"(SMB -> LDAP/LDAPS). Use ntlmrelayx with --remove-mic."
                     ),
                     source_ips=host_ips,
-                    dest_ips=host_ips
+                    dest_ips=host_ips,
                 )
                 paths.append(path)
 
@@ -453,3 +495,64 @@ class RelayAnalyzer:
         }
 
         return descriptions.get(protocol, f"Relay to {protocol} on {host}")
+
+    def add_ghost_spn_paths(self, analysis: Dict, ghost_spn_results: Dict, max_paths: int = 5):
+        """
+        Inject up to max_paths Ghost SPN relay paths into analysis['relay_paths'].
+
+        All findings are capped at max_paths entries in the report to avoid clutter.
+        The caller is responsible for writing the full list to a separate file.
+        ghost_spn_results is mutated to record truncation metadata.
+        """
+        impact_order = {
+            RelayImpact.CRITICAL: 0,
+            RelayImpact.HIGH: 1,
+            RelayImpact.MEDIUM: 2,
+            RelayImpact.LOW: 3,
+        }
+
+        # Combine all findings, prioritising definite (no DNS) over probable (wildcard)
+        all_findings = []
+        for finding in ghost_spn_results.get('vulnerable', []):
+            all_findings.append(('vulnerable', finding))
+        for finding in ghost_spn_results.get('probably_vulnerable', []):
+            all_findings.append(('probably_vulnerable', finding))
+
+        total = len(all_findings)
+        shown = all_findings[:max_paths]
+        truncated = total > max_paths
+
+        # Record truncation metadata so formatters can reference the output file
+        ghost_spn_results['_total_findings'] = total
+        ghost_spn_results['_truncated'] = truncated
+
+        for kind, finding in shown:
+            if kind == 'vulnerable':
+                description = (
+                    f"Ghost SPN: '{finding.get('spn')}' is registered to '{finding.get('account')}' "
+                    f"but '{finding.get('hostname')}' has no DNS record - "
+                    f"Register this DNS name to receive NTLM authentication and relay it."
+                )
+            else:
+                resolved = ', '.join(finding.get('resolved_to', []))
+                description = (
+                    f"Ghost SPN (wildcard DNS): '{finding.get('spn')}' registered to "
+                    f"'{finding.get('account')}' - '{finding.get('hostname')}' resolves to "
+                    f"{resolved or 'wildcard'} via wildcard DNS. May be exploitable for NTLM relay."
+                )
+
+            path = RelayPath(
+                source_host=finding.get('account', 'unknown'),
+                source_protocol='ghost_spn',
+                dest_host=finding.get('hostname', 'unknown'),
+                dest_protocol='any',
+                impact=RelayImpact.MEDIUM,
+                description=description,
+                source_ips=[],
+                dest_ips=[],
+            )
+            analysis['relay_paths'].append(path)
+            analysis['statistics']['medium_paths'] += 1
+
+        # Re-sort so Ghost SPN paths sit alongside other MEDIUM findings
+        analysis['relay_paths'].sort(key=lambda p: impact_order[p.impact])
