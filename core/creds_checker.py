@@ -66,14 +66,6 @@ class CredentialChecker:
                         nthash=self.config.nthash or '',
                         authenticationChoice='sasl'
                     )
-                # set to size 10 so it doesn't failed as an auth failure in a large env with GPO 10k+
-                ldap_conn.search(
-                    searchBase=f"CN=Policies,CN=System,{self._get_base_dn()}",
-                    searchFilter="(objectClass=groupPolicyContainer)",
-                    attributes=['displayName', 'gPCFileSysPath'],
-                    scope=ldapasn1_impacket.Scope('wholeSubtree'),
-                    sizeLimit=10
-                )
 
                 result['status'] = "success"
                 result['error'] = "None"
