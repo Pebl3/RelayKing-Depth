@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relayking"
+version = "1.0.0"
+description = "NTLM & Kerberos Relay Detection and Enumeration Tool"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [{name = "RelayKing Contributors"}]
+dynamic = ["dependencies"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Security",
+]
+
+[project.urls]
+Homepage = "https://github.com/depthsecurity/RelayKing-Depth"
+
+[project.scripts]
+relayking = "relayking:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools]
+py-modules = ["relayking"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
