@@ -319,9 +319,9 @@ def output_result(results, loop_count, group_size, split_into, idxlen, config, a
         if config.output_file:
             # Generate filename with appropriate extension
             if split_into == 1:
-            	base_name = config.output_file
+                base_name = config.output_file
             else:
-            	base_name = config.output_file + "_" + str(loop_count).zfill(idxlen)
+                base_name = config.output_file + "_" + str(loop_count).zfill(idxlen)
 
             extension = format_extensions.get(output_format, '.txt')
             output_path = base_name + extension
